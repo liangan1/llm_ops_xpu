@@ -21,7 +21,7 @@
 
 using namespace cute;
 
-namespace llm_xpu_ops
+namespace llm_ops_xpu
 {
 
     // Function to perform matrix multiplication

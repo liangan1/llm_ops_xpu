@@ -4,7 +4,7 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
-namespace llm_xpu_ops {
+namespace llm_ops_xpu {
 
 torch::Tensor matmul(torch::Tensor a,
 		 torch::Tensor b);
