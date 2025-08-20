@@ -1,0 +1,14 @@
+#include "gemm.h"
+
+namespace llm_ops_xpu {
+
+TORCH_LIBRARY(llm_ops_xpu, m) {
+  m.def("matmul(Tensor a, Tensor b) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(llm_ops_xpu, XPU, m) {
+    m.impl("matmul", &matmul);
+}
+
+
+}  // namespace llm_ops_xpu
