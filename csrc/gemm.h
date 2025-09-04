@@ -9,4 +9,7 @@ namespace llm_ops_xpu {
 torch::Tensor matmul(torch::Tensor a,
 		 torch::Tensor b);
 
+torch::Tensor grouped_gemm(torch::Tensor a,
+		 torch::Tensor b, torch::Tensor offs);
+
 }  // namespace llm_ops_xpu
