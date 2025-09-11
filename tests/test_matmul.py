@@ -23,20 +23,17 @@ class TestMatmul(TestCase):
 class TestGroupedGEMM(TestCase):
     def grouped_mm_helper(self, alist, blist, outlist):
         for a, b, out in zip(alist, blist, outlist):
-            import pdb
-            pdb.set_trace()
             out_ref = torch.matmul(a, b.transpose(-2, -1).contiguous())
             self.assertEqual(out, out_ref)
             
     def test_grouped_gemm_2d_3d(self):
         device = "xpu"
+        
         m, n, k, n_groups = 1024, 4096, 2048, 4
         a = torch.randn(m * n_groups, k, device=device).to(torch.bfloat16)[:, :k]
         b = torch.randn(n_groups, n, k, device=device).to(torch.bfloat16)[::(1), :, :k]
         offs = torch.arange(m, n_groups * m + 1, m, device="cpu", dtype=torch.int32)
-        import pdb
-        pdb.set_trace()
-        out = torch.ops.llm_ops_xpu.grouped_gemm(a, b.transpose(-2, -1).contiguous(), offs=offs)
+        out = torch.ops.llm_ops_xpu.grouped_gemm(a, b.transpose(-2, -1).contiguous(), offs=offs).to(torch.bfloat16)
 
         offs_cpu = offs.cpu()
         alist, outlist = [], []
