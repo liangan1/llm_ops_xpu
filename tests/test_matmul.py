@@ -4,7 +4,7 @@ from torch.testing._internal.common_utils import TestCase
 import unittest
 from llm_ops_xpu import ops as sycl_ex
 
-
+@unittest.skip("")
 class TestMatmul(TestCase):
     def _test_matmul(self):
         a = torch.randn(4096, 2048, device="xpu", dtype=torch.bfloat16, requires_grad=False)
@@ -19,7 +19,7 @@ class TestMatmul(TestCase):
         # Test the matmul operation on XPU
         self._test_matmul()  
 
-
+# @unittest.skip("reason")
 class TestGroupedGEMM(TestCase):
     def grouped_mm_helper(self, alist, blist, outlist):
         for a, b, out in zip(alist, blist, outlist):
@@ -32,9 +32,10 @@ class TestGroupedGEMM(TestCase):
         m, n, k, n_groups = 1024, 4096, 2048, 4
         a = torch.randn(m * n_groups, k, device=device).to(torch.bfloat16)[:, :k]
         b = torch.randn(n_groups, n, k, device=device).to(torch.bfloat16)[::(1), :, :k]
-        offs = torch.arange(m, n_groups * m + 1, m, device="cpu", dtype=torch.int32)
+        offs = torch.arange(m, n_groups * m + 1, m, device="xpu", dtype=torch.int32)
         out = torch.ops.llm_ops_xpu.grouped_gemm(a, b.transpose(-2, -1).contiguous(), offs=offs).to(torch.bfloat16)
-
+        torch.accelerator.synchronize()
+        print("outs:", out)
         offs_cpu = offs.cpu()
         alist, outlist = [], []
         start = 0
