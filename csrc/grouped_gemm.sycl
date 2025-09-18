@@ -13,6 +13,20 @@
 #include <c10/xpu/XPUCachingAllocator.h>
 #include <random>
 
+#include <ATen/core/Tensor.h>
+#include <ATen/TensorUtils.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/CPUFunctions.h>
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/bmm.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_strided.h>
+#include <ATen/ops/mm.h>
+#endif
+
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
@@ -31,10 +45,136 @@ namespace llm_ops_xpu
     {
         return (a + b - 1) / b * b;
     }
+    inline bool check_valid_strides_and_return_transposed(const at::Tensor &mat)
+    {
+        auto tensor_strides = mat.strides();
+        auto tensor_sizes = mat.sizes();
+        int end_dim = mat.dim() - 1;
+        int alignment = 16 / mat.element_size();
+        TORCH_CHECK(uint64_t(mat.data_ptr()) % 16 == 0, "expected data_ptr to be aligned to 16 bytes\n");
+        if ((tensor_strides[end_dim - 1] == 1) && (tensor_strides[end_dim] >= std::max<int64_t>(1, tensor_sizes[end_dim - 1])))
+        {
+            TORCH_CHECK(tensor_strides[end_dim] % alignment == 0, "strides should be multiple of 16 bytes");
+            return true;
+        }
+        else if ((tensor_strides[end_dim] == 1) && (tensor_strides[end_dim - 1] >= std::max<int64_t>(1, tensor_sizes[end_dim])))
+        {
+            TORCH_CHECK(tensor_strides[end_dim - 1] % alignment == 0, "strides should be multiple of 16 bytes");
+            return false;
+        }
+        else
+        {
+            TORCH_CHECK(false, "Invalid strides/sizes, got ", mat.strides(), " for strides and ", mat.sizes(), " for sizes");
+        }
+    }
+    inline at::Tensor create_grouped_gemm_output_tensor(const at::Tensor &mat_a,
+                                                        const at::Tensor &mat_b,
+                                                        const std::optional<at::Tensor> &offs,
+                                                        c10::ScalarType out_dtype)
+    {
+        c10::SmallVector<int64_t, 3> out_size;
+        const bool a_is_2d = mat_a.dim() == 2;
+        const bool b_is_2d = mat_b.dim() == 2;
+        if (a_is_2d)
+        {
+            if (b_is_2d)
+            {
+                out_size = {offs->size(0), mat_a.size(0), mat_b.size(1)};
+            }
+            else
+            {
+                TORCH_CHECK(offs->size(0) == mat_b.size(0), "matrix batch sizes have to match");
+                out_size = {mat_a.size(0), mat_b.size(-1)};
+            }
+        }
+        else
+        {
+            if (b_is_2d)
+            {
+                // this case is not actually encountered for MoE gemms
+                TORCH_CHECK(offs->size(0) == mat_a.size(0), "matrix batch sizes have to match");
+                out_size = {mat_a.size(1), mat_b.size(1)};
+            }
+            else
+            { // regular bmm
+                TORCH_CHECK(mat_a.size(0) == mat_b.size(0), "batched dimension has to match");
+                out_size = {mat_a.size(0), mat_a.size(1), mat_b.size(-1)};
+            }
+        }
+
+#ifndef USE_ROCM
+        // For TMA transfers, strides of output tensor have to be either
+        // 1, or aligned to 16 bytes.
+        const auto last_dim = out_size.size() - 1;
+        const auto alignment = 16 / c10::elementSize(out_dtype);
+        const int64_t size_padded = (out_size[last_dim] + alignment - 1) / alignment * alignment;
+        std::vector<int64_t> out_stride;
+        if (a_is_2d != b_is_2d)
+        {
+            out_stride = {size_padded, 1};
+        }
+        else
+        {
+            out_stride = {out_size[1] * size_padded, size_padded, 1};
+        }
+        return at::empty_strided(out_size, out_stride, mat_a.options().dtype(out_dtype));
+#else
+        return at::empty(out_size, mat_a.options().dtype(out_dtype));
+#endif
+    }
+
+    inline void _grouped_mm_validate_inputs(const at::Tensor &mat_a, const at::Tensor &mat_b,
+                                            const std::optional<at::Tensor> &offs,
+                                            const std::optional<at::Tensor> &bias,
+                                            std::optional<c10::ScalarType> out_dtype)
+    {
+        TORCH_CHECK((mat_a.dtype() == at::kBFloat16) || (mat_a.dtype() == at::kFloat) || (mat_a.dtype() == at::kHalf), "Expected mat_a to be Float32, BFloat16 or Float16 matrix, got ", mat_a.scalar_type());
+        TORCH_CHECK((mat_b.dtype() == at::kBFloat16) || (mat_b.dtype() == at::kFloat) || (mat_b.dtype() == at::kHalf), "Expected mat_b to be Float32, BFloat16 or Float16 matrix, got ", mat_b.scalar_type());
+        TORCH_CHECK(mat_a.dim() == 2 || mat_a.dim() == 3, "mat_a has to be 2 or 3d");
+        TORCH_CHECK(mat_b.dim() == 2 || mat_b.dim() == 3, "mat_b has to be 2 or 3d");
+        const bool a_is_2d = mat_a.dim() == 2;
+        const bool b_is_2d = mat_b.dim() == 2;
+        if (!a_is_2d || !b_is_2d)
+        {
+            TORCH_CHECK(mat_a.size(-1) == mat_b.size(-2), "contraction dimension of mat_a and mat_b must match");
+        }
+
+        // check that the strides are valid, the fn will throw an  at::Tensor if not
+        check_valid_strides_and_return_transposed(mat_a);
+        check_valid_strides_and_return_transposed(mat_b);
+        TORCH_CHECK(offs.has_value() == (a_is_2d || b_is_2d), "Have to provide offsets if there is a 2d matrix, or no offset if both matrices are 3d");
+
+        if (offs.has_value())
+        {
+            TORCH_CHECK(offs->dim() == 1, "offs has to be 1D");
+            TORCH_CHECK(offs->dtype() == at::kInt, "Offsets have to be int32");
+        }
+        TORCH_CHECK(!bias.has_value(), "Bias not supported yet");
+    }
+
+    inline c10::ScalarType _resolve_grouped_mm_out_dtype(const at::Tensor &mat_a, const at::Tensor &mat_b,
+                                                         std::optional<c10::ScalarType> out_dtype)
+    {
+        const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
+        // TODO(future PR): enable float32 output dtype for bfloat16 and float16 inputs
+        TORCH_CHECK(out_dtype_ == mat_a.dtype(), "Grouped gemm output dtype must match `mat_a` dtype");
+        return out_dtype_;
+    }
 
     // Function to perform matrix multiplication
     // similar to https://github.com/pytorch/pytorch/blob/f9875166a953a51bbd454d963ee03d41818a27e8/aten/src/ATen/native/cuda/Blas.cpp#L1661
-    torch::Tensor grouped_gemm(torch::Tensor mat_a, torch::Tensor mat_b, torch::Tensor offs)
+    template <
+        bool a_row_major,
+        bool b_row_major,
+        typename TB_M,
+        typename TB_N,
+        typename TB_K>
+    void bf16bf16_grouped_gemm_impl(
+        at::Tensor mat_a, // bf16
+        at::Tensor mat_b, // bf16
+        std::optional<at::Tensor> offs,
+        std::optional<at::Tensor> bias, // BF16
+        at::Tensor &output)
     {
 
         // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
@@ -47,16 +187,24 @@ namespace llm_ops_xpu
 
         // The code section below describes datatype for input, output matrices and computation between
         // elements in input matrices.
-        using DtypeAccum = float;             // <- data type of accumulator
-        using ElementComputeEpilogue = float; // <- data type of epilogue operations
-        using DtypeA = bfloat16_t;            // <- data type of elements in input matrix A
-        using DtypeB = bfloat16_t;            // <- data type of elements in input matrix B
-        using Dtypeout = float;               // <- data type of elements in output matrix D
+        using DtypeA = cutlass::bfloat16_t;
+        using DtypeB = cutlass::bfloat16_t;
+        using DtypeOutput = float;
+        using DtypeAccum = float;
+        using ElementComputeEpilogue = float;
+        using LayoutA = cute::conditional_t<
+            a_row_major,
+            cutlass::layout::RowMajor,
+            cutlass::layout::ColumnMajor>;
 
-        using LayoutA = cutlass::layout::RowMajor;
-        using LayoutB = cutlass::layout::RowMajor;
-        using LayoutC = cutlass::layout::RowMajor;
-        using LayoutD = cutlass::layout::RowMajor;
+        constexpr int AlignmentA = 16 / sizeof(DtypeA);
+
+        using LayoutB = cute::conditional_t<
+            b_row_major,
+            cutlass::layout::RowMajor,
+            cutlass::layout::ColumnMajor>;
+        constexpr int AlignmentB = 16 / sizeof(DtypeB);
+        using LayoutOutput = cutlass::layout::RowMajor;
 
         using GmemTiledCopyA = XE_2D_U16x32x32_LD_N;
         using GmemTiledCopyB = XE_2D_U16x32x32_LD_V;
@@ -75,7 +223,7 @@ namespace llm_ops_xpu
         using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16Group<PipelineStages>;
         using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
 
-        using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<Dtypeout, ElementComputeEpilogue,
+        using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<DtypeOutput, ElementComputeEpilogue,
                                                                         DtypeAccum, DtypeAccum, cutlass::FloatRoundStyle::round_to_nearest>;
 
         using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<EpilogueDispatchPolicy, EpilogueOp, TileShape,
@@ -84,9 +232,9 @@ namespace llm_ops_xpu
             EpilogueDispatchPolicy,
             TileShape,
             DtypeAccum,
-            cutlass::gemm::TagToStrideC_t<LayoutC *>,
-            Dtypeout,
-            cutlass::gemm::TagToStrideC_t<LayoutD *>,
+            cutlass::gemm::TagToStrideC_t<LayoutOutput *>,
+            DtypeOutput,
+            cutlass::gemm::TagToStrideC_t<LayoutOutput *>,
             FusionCallBacks,
             XE_2D_U32x8x16_LD_N,
             void, void,
@@ -121,13 +269,11 @@ namespace llm_ops_xpu
         M = mat_a.size(-2);
         K = mat_a.size(-1);
         N = mat_b.size(-1);
-        auto output = at::ones({mat_a.size(0), N}, mat_a.options().dtype(at::kFloat));
-        
 
         if (mat_a.dim() == 2 && mat_b.dim() == 2)
         {
             // if both inputs are ragged, K is dynamic, M and N come from inputs
-            group_count = offs.size(0);
+            group_count = offs->size(0);
             K = -1;
         }
         else if (mat_a.dim() == 2)
@@ -167,8 +313,8 @@ namespace llm_ops_xpu
         DtypeA **inputA_ptrs = reinterpret_cast<DtypeA **>(buf_ptr);
         DtypeB **inputB_ptrs =
             reinterpret_cast<DtypeB **>(inputA_ptrs + aligned_group_count);
-        Dtypeout **out_ptrs =
-            reinterpret_cast<Dtypeout **>(inputB_ptrs + aligned_group_count);
+        DtypeOutput **out_ptrs =
+            reinterpret_cast<DtypeOutput **>(inputB_ptrs + aligned_group_count);
         static_assert(
             sizeof(StrideA) == 8, "expected StrideA to be 8 bytes for alignment");
         StrideA *stride_A =
@@ -186,16 +332,16 @@ namespace llm_ops_xpu
             std::copy(strides.begin(), strides.end(), stride_values.begin());
             return stride_values;
         };
-          
+
         Strides tensor_StrideA = make_strides(mat_a.strides());
         Strides tensor_StrideB = make_strides(mat_b.strides());
         Strides tensor_Strideout = make_strides(output.strides());
         Strides tensor_ShapeA = make_strides(mat_a.sizes());
         Strides tensor_ShapeB = make_strides(mat_b.sizes());
-        auto prepared_data_kernel = PreparedGroupedGEMMDataKernel<DtypeA, DtypeB, Dtypeout, float, ProblemShape::UnderlyingProblemShape, StrideA, StrideB, Strideout>(
+        auto prepared_data_kernel = PreparedGroupedGEMMDataKernel<DtypeA, DtypeB, DtypeOutput, float, ProblemShape::UnderlyingProblemShape, StrideA, StrideB, Strideout>(
             reinterpret_cast<DtypeA *>(mat_a.data_ptr()),
             reinterpret_cast<DtypeB *>(mat_b.data_ptr()),
-            reinterpret_cast<Dtypeout *>(output.data_ptr()),
+            reinterpret_cast<DtypeOutput *>(output.data_ptr()),
             static_cast<float *>(nullptr),
             static_cast<float *>(nullptr),
             inputA_ptrs,
@@ -207,7 +353,7 @@ namespace llm_ops_xpu
             stride_A,
             stride_B,
             stride_out,
-            offs.const_data_ptr<int32_t>(),
+            offs.has_value() ? reinterpret_cast<int32_t *>(offs->data_ptr()) : nullptr,
             M,
             N,
             K,
@@ -216,10 +362,10 @@ namespace llm_ops_xpu
             tensor_Strideout,
             tensor_ShapeA,
             tensor_ShapeB,
-            0,    // offsetA
-            0,    // offsetB
-            true, // a_row_major
-            true);
+            0, // offsetA
+            0, // offsetB
+            a_row_major,
+            b_row_major);
         // launch the sycl kernel of preparing data
         sycl::queue q = c10::xpu::getCurrentXPUStream().queue();
         auto global_range = sycl::range<1>(group_count);
@@ -238,7 +384,7 @@ namespace llm_ops_xpu
              (const DtypeB **)inputB_ptrs,
              stride_B},
             {{},
-             (const Dtypeout **)out_ptrs,
+             (const DtypeOutput **)out_ptrs,
              stride_out,
              out_ptrs,
              stride_out}};
@@ -258,8 +404,114 @@ namespace llm_ops_xpu
         auto status = gemm.run(at::xpu::getCurrentXPUStream());
         TORCH_CHECK(
             status == cutlass::Status::kSuccess,
-            "cutlass cannot run, error ",
+            "cutlass cannot run,  at::Tensor ",
             int(status));
-        return output;
     }
+
+    template <bool a_row_major, bool b_row_major>
+    void dispatch_bf16_grouped_kernel_on_tile_size(
+        at::Tensor mat_a, // bf16
+        at::Tensor mat_b, // bf16
+        std::optional<at::Tensor> offs,
+        std::optional<at::Tensor> bias, // BF16
+        at::Tensor &out)
+    {
+        int32_t M, N, K, group_count;
+
+        M = mat_a.size(-2);
+        K = mat_a.size(-1);
+        N = mat_b.size(-1);
+
+        // below we assume that gemms are approx same size
+        if (mat_a.dim() == 2 && mat_b.dim() == 2)
+        {
+            // if both inputs are ragged, K is dynamic, M and N come from inputs
+            group_count = offs->size(0);
+            K = K / group_count;
+        }
+        else if (mat_a.dim() == 2)
+        {
+            group_count = mat_b.size(0);
+            M = M / group_count;
+        }
+        else if (mat_b.dim() == 2)
+        {
+            group_count = mat_a.size(0);
+            N = N / group_count;
+        }
+        bool small = (M <= 128 || N <= 128);
+        if (small)
+        {
+            bf16bf16_grouped_gemm_impl<
+                a_row_major,
+                b_row_major,
+                cute::_256,
+                cute::_256,
+                cute::_32>(mat_a, mat_b, offs, bias, out); // Tile shape taken from CUTLASS examples, 64 = 128/sizeof(bfloat16)
+        }
+        else
+        {
+            bf16bf16_grouped_gemm_impl<
+                a_row_major,
+                b_row_major,
+                cute::_256,
+                cute::_256,
+                cute::_32>(mat_a, mat_b, offs, bias, out); // Same as above ^
+        }
+    }
+
+    void dispatch_bf16_grouped_kernel_on_ab_transpose(
+        at::Tensor mat_a, // bf16
+        at::Tensor mat_b, // bf16
+        std::optional<at::Tensor> offs,
+        std::optional<at::Tensor> bias, // BF16
+        at::Tensor &out)
+    {
+        // we already checked that one of the strides is 1
+        bool a_row_major = mat_a.stride(-1) == 1;
+        bool b_row_major = mat_b.stride(-1) == 1;
+        TORCH_CHECK(a_row_major, "mat_a has to be row major on XPU");
+        if (a_row_major && b_row_major)
+        {
+            dispatch_bf16_grouped_kernel_on_tile_size<true, true>(
+                mat_a, mat_b, offs, bias, out);
+        }
+        else if (a_row_major && !b_row_major)
+        {
+            dispatch_bf16_grouped_kernel_on_tile_size<true, false>(
+                mat_a, mat_b, offs, bias, out);
+        }
+        else
+        {
+            TORCH_CHECK(false, "mat_a has to be row major on XPU");
+        }
+        // else if (!a_row_major && b_row_major)
+        // {
+        //     dispatch_bf16_grouped_kernel_on_tile_size<false, true>(
+        //         mat_a, mat_b, offs, bias, out);
+        // }
+        // else
+        // {
+        //     dispatch_bf16_grouped_kernel_on_tile_size<false, false>(
+        //         mat_a, mat_b, offs, bias, out);
+        // }
+     }
+
+    at::Tensor grouped_gemm(const at::Tensor &mat_a, const at::Tensor &mat_b,
+                          const std::optional<at::Tensor> &offs,
+                          const std::optional<at::Tensor> &bias,
+                          std::optional<c10::ScalarType> out_dtype)
+    {
+        _grouped_mm_validate_inputs(mat_a, mat_b, offs, bias, out_dtype);
+        bool a_b_and_out_are_bf16 = (mat_a.dtype() == at::kBFloat16 &&
+                                     mat_b.dtype() == at::kBFloat16 &&
+                                     out_dtype.value_or(at::kBFloat16) == at::kBFloat16);
+        //const auto out_dtype_ = _resolve_grouped_mm_out_dtype(mat_a, mat_b, out_dtype);
+        //ToDO by liangan1: enable output dtype for bfloat16 and float16 inputs
+        at::Tensor out = create_grouped_gemm_output_tensor(mat_a, mat_b, offs, c10::kFloat);
+        dispatch_bf16_grouped_kernel_on_ab_transpose(mat_a, mat_b, offs, bias, out);
+
+        return out;
+    }
+
 }

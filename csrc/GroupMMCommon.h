@@ -132,8 +132,7 @@ namespace llm_ops_xpu
                     inputB_scale_ptrs[tid] = scale_B + tid * b_scale_stride;
                 }
             }
-            printf("group %d: A ptr %p, B ptr %p, output ptr %p, M %d, N %d, K %d, real_M %d, real_N %d,  real_K %d, lda %d, ldb %d, ldoutput %d\n",
-                   tid, A_ptrs[tid], B_ptrs[tid], output_ptrs[tid], M, N, K, real_M, real_N, real_K, lda, ldb, ldoutput);
+            
             problem_sizes[tid] = ProblemShape(real_M, real_N, real_K);
 
             // make_cute_packed_stride only replaces one of the stride elements with

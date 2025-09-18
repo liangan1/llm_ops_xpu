@@ -6,10 +6,15 @@
 
 namespace llm_ops_xpu {
 
-torch::Tensor matmul(torch::Tensor a,
-		 torch::Tensor b);
+ at::Tensor matmul( at::Tensor a,
+		  at::Tensor b);
 
-torch::Tensor grouped_gemm(torch::Tensor a,
-		 torch::Tensor b, torch::Tensor offs);
+ at::Tensor grouped_gemm(
+		 const  at::Tensor& a,
+		 const  at::Tensor& b, 
+		 const  std::optional<at::Tensor>& offs,
+		 const std::optional<at::Tensor>& bias,
+		 std::optional<c10::ScalarType> out_dtype
+		 );
 
 }  // namespace llm_ops_xpu
