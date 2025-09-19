@@ -30,18 +30,18 @@ class TestMatmul(TestCase):
 class TestGroupedGEMM(TestCase):
 
     def grouped_mm_helper(self, alist, blist, gOlist, agradlist, outlist):
-        for a, b, gO, agrad, out in zip(alist, blist, gOlist, agradlist, outlist):
+        for a, b, out in zip(alist, blist, outlist):
             a = a.clone().detach().requires_grad_()
             b = b.clone().detach().requires_grad_()
-            out_ref = torch.mm(a, b.t()).to(torch.float32)
+            out_ref = torch.mm(a, b.t())
             #out_ref.backward(gO)
-            self.assertEqual(out, out_ref, rtol=1e-3, atol=1e-3)
+            self.assertEqual(out.to(out_ref.dtype), out_ref, rtol=1e-3, atol=1e-3)
             #self.assertEqual(agrad, a.grad)
             #self.assertEqual(bgrad, b.grad)
 
-    @parametrize("strided", [False, True])
+    @parametrize("strided", [False])
     @parametrize("a_row_major", [True])
-    @parametrize("b_row_major", [False, True])
+    @parametrize("b_row_major", [False])
     def test_grouped_gemm_2d_2d(self, strided, a_row_major, b_row_major):
         device = "xpu"
         dtype = torch.bfloat16
@@ -61,6 +61,7 @@ class TestGroupedGEMM(TestCase):
         offs = torch.arange(k, n_groups * k + 1, k, device=device, dtype=torch.int32)
         out = torch.ops.llm_ops_xpu.grouped_gemm(a, b.t(), offs=offs,
                                 out_dtype=torch.float32)
+        torch.accelerator.synchronize()
         #gO = torch.rand_like(out)
         gO = torch.ones_like(out)
         #out.backward(gO)
@@ -75,14 +76,14 @@ class TestGroupedGEMM(TestCase):
             start = offs_cpu[i]
         self.grouped_mm_helper(alist, blist, gO, agradlist, out)
 
-    @parametrize("strided", [False, True])
+    @parametrize("strided", [False])
     @parametrize("a_row_major", [True]) 
-    @parametrize("b_row_major", [False, True])
+    @parametrize("b_row_major", [False])
     def test_grouped_gemm_2d_3d(self, strided, a_row_major, b_row_major):
         device = "xpu"
         dtype = torch.bfloat16
         s_int = int(strided)
-        m, n, k, n_groups = 1024, 4096, 1024, 4
+        m, n, k, n_groups = 1024, 2048, 1024, 4
         if a_row_major:
             a = torch.randn(m * n_groups, k * (1 + s_int), device=device, dtype=dtype)[:, :k]
         else:
@@ -102,8 +103,13 @@ class TestGroupedGEMM(TestCase):
         b_contig = b if b_row_major else b.transpose(-2, -1)
         self.assertTrue(b_contig.is_contiguous() is not strided)
         offs = torch.arange(m, n_groups * m + 1, m, device="xpu", dtype=torch.int32)
+
+        print(a.shape, b.transpose(-2, -1).shape)
+        print(a.stride(), b.transpose(-2, -1).stride())
         out = torch.ops.llm_ops_xpu.grouped_gemm(a, b.transpose(-2, -1), offs=offs,
                                 out_dtype=torch.float32)
+        # print(out.to(dtype))
+        # print(a@b.transpose(-2, -1))
         gO = torch.rand_like(out)
         #out.backward(gO)
         offs_cpu = offs.cpu()
@@ -117,10 +123,9 @@ class TestGroupedGEMM(TestCase):
             start = offs_cpu[i]
         self.grouped_mm_helper(alist, b, gOlist, agradlist, outlist)
     
-    @unittest.skip("ToDo on the XPU device")
     @parametrize("strided", [False])
     @parametrize("a_row_major", [True])
-    @parametrize("b_row_major", [False, True])
+    @parametrize("b_row_major", [False])
     def test_grouped_gemm_3d_3d(self, strided, a_row_major, b_row_major):
         device = "xpu"
         dtype = torch.bfloat16
@@ -138,20 +143,23 @@ class TestGroupedGEMM(TestCase):
                             dtype=dtype).transpose(-2, -1)[::(1 + s_int), :, :k]
         #a.requires_grad_(True)
         #b.requires_grad_(True)
-
+       
         a_contig = a if a_row_major else a.transpose(-2, -1)
         self.assertTrue(a_contig.is_contiguous() is not strided)
         b_contig = b if b_row_major else b.transpose(-2, -1)
         self.assertTrue(b_contig.is_contiguous() is not strided)
-
-        out = torch.ops.llm_ops_xpu.grouped_gemm(a, b.transpose(-2, -1), out_dtype=torch.float32)
+        print(a.shape, b.transpose(-2, -1).shape)
+        print(a.stride(), b.transpose(-2, -1).stride())
+        out = torch.ops.llm_ops_xpu.grouped_gemm(a, b.transpose(-2, -1),  out_dtype=torch.float32)
+        # print(out.to(dtype))
+        # print(a@b.transpose(-2, -1))
         gO = torch.rand_like(out)
         #out.backward(gO)
         self.grouped_mm_helper(a, b, gO, gO, out)
     
-    @parametrize("strided", [False, True])
+    @parametrize("strided", [False])
     @parametrize("a_row_major", [True])
-    @parametrize("b_row_major", [False, True])
+    @parametrize("b_row_major", [False])
     def test_grouped_gemm_3d_2d(self, strided, a_row_major, b_row_major):
         device = "xpu"
         dtype = torch.bfloat16

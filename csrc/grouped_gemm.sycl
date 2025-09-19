@@ -471,6 +471,7 @@ namespace llm_ops_xpu
         bool a_row_major = mat_a.stride(-1) == 1;
         bool b_row_major = mat_b.stride(-1) == 1;
         TORCH_CHECK(a_row_major, "mat_a has to be row major on XPU");
+        TORCH_CHECK(b_row_major, "mat_b has to be row major on XPU");
         if (a_row_major && b_row_major)
         {
             dispatch_bf16_grouped_kernel_on_tile_size<true, true>(
