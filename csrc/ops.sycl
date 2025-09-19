@@ -4,11 +4,14 @@ namespace llm_ops_xpu {
 
 TORCH_LIBRARY(llm_ops_xpu, m) {
   m.def("matmul(Tensor a, Tensor b) -> Tensor");
+  m.def("grouped_gemm(Tensor a, Tensor b, Tensor? offs=None, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(llm_ops_xpu, XPU, m) {
     m.impl("matmul", &matmul);
+    m.impl("grouped_gemm", &grouped_gemm);
 }
 
 
 }  // namespace llm_ops_xpu
+

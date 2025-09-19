@@ -7,7 +7,8 @@ from torch.utils.cpp_extension import SyclExtension, BuildExtension
 library_name = "llm_ops_xpu"
 py_limited_api = True
 extra_compile_args = {
-    "sycl": ["-O3",
+    "sycl": ["-O1",
+             "-g",
              "-DCUTLASS_ENABLE_SYCL",
              "-DSYCL_INTEL_TARGET",
              "-fsycl-targets=intel_gpu_bmg_g21",
