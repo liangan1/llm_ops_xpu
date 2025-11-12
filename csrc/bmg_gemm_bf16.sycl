@@ -181,7 +181,7 @@ namespace llm_ops_xpu
         // Run the GEMM
         CUTLASS_CHECK(gemm_op.run());
 
-        syclcompat::wait();
+        //syclcompat::wait();
 
         return output;
     }
